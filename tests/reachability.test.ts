@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../src/sol-pi/config.ts";
 import { createSolPiExtension } from "../src/sol-pi/index.ts";
+import { registerActionFusion } from "../src/sol-pi/extensions/action-fusion/index.ts";
 import {
 	REACHABILITY_EVENT_SCHEMA,
 	REACHABILITY_EVENT_TYPE,
@@ -20,10 +21,9 @@ import {
 } from "../src/sol-pi/reachability.ts";
 import { FakePi, fakeContext } from "./helpers.ts";
 
-const thenRunParameters = Type.Object({
-	path: Type.String(),
-	then_run: Type.Optional(Type.Object({ command: Type.String() })),
-});
+const fusedPi = new FakePi();
+registerActionFusion(fusedPi.asExtensionApi());
+const thenRunParameters = fusedPi.registeredTools.find((tool) => tool.name === "edit")!.parameters;
 
 const plainParameters = Type.Object({
 	code: Type.String(),
@@ -47,6 +47,59 @@ function installToolSurface(
 }
 
 describe("mechanism reachability", () => {
+	it.each(["edit", "write"])("accepts active fused %s as a reducer path without bash", (name) => {
+		const tool = fusedPi.registeredTools.find((tool) => tool.name === name)!;
+		expect(reachabilityFindings(config({ actionFusion: true, evidencePreservingReducer: true }),
+			surface([tool]))).toEqual([]);
+	});
+
+	it.each(["fabric_exec", "edit", "write"])("rejects unrelated %s with its own then_run", (name) => {
+		const parameters = Type.Object({ then_run: Type.Optional(Type.String()) });
+		const findings = reachabilityFindings(config({ actionFusion: true, evidencePreservingReducer: true }),
+			surface([{ name, parameters }], [{ name, parameters }, ...fusedPi.registeredTools]));
+		expect(findings.map((finding) => finding.reason)).toEqual([
+			"then_run-not-on-active-tools", "reducer-path-absent",
+		]);
+	});
+
+	it("does not persist provisional session-start warnings", async () => {
+		const pi = new FakePi();
+		installToolSurface(pi, [{ name: "fabric_exec", parameters: plainParameters }]);
+		createSolPiExtension(() => config({ actionFusion: true, evidencePreservingReducer: true }))(pi.asExtensionApi());
+		pi.on("session_start", () => installToolSurface(pi, pi.registeredTools));
+		const ctx = fakeContext(pi.sessionManager);
+		await pi.emit("session_start", {}, ctx);
+		expect(pi.sessionManager.customEntryData()).toEqual([]);
+		await pi.emit("before_provider_request", {}, ctx);
+		expect(pi.sessionManager.customEntryData()).toEqual([]);
+	});
+
+	it("re-appends on a new branch and keeps inherited warnings deduplicated", async () => {
+		const pi = new FakePi();
+		installToolSurface(pi, [{ name: "fabric_exec", parameters: plainParameters }]);
+		const ctx = fakeContext(pi.sessionManager);
+		watchMechanismReachability(pi.asExtensionApi(), config({ actionFusion: true }));
+		await pi.emit("before_provider_request", {}, ctx);
+		const originalBranch = [...pi.sessionManager.entries];
+		// Model tree navigation to an ancestor that does not contain the warning.
+		pi.sessionManager.entries.splice(0);
+		await pi.emit("session_tree", {}, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		expect(pi.sessionManager.customEntryData()).toHaveLength(1);
+		// Navigating back to the original branch must not duplicate its warning.
+		pi.sessionManager.entries.splice(0, pi.sessionManager.entries.length, ...originalBranch);
+		await pi.emit("session_tree", {}, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		expect(pi.sessionManager.customEntryData()).toHaveLength(1);
+	});
+
+	it("skips incomplete inspection APIs instead of reporting missing paths", () => {
+		const pi = new FakePi();
+		installToolSurface(pi, [{ name: "bash" }]);
+		(pi as unknown as { getAllTools: () => never }).getAllTools = () => { throw new Error("not ready"); };
+		expect(readToolSurface(pi.asExtensionApi())).toBeUndefined();
+	});
+
 	it("detects then_run on a TypeBox tool schema", () => {
 		expect(toolExposesThenRun({ name: "edit", parameters: thenRunParameters })).toBe(true);
 		expect(toolExposesThenRun({ name: "fabric_exec", parameters: plainParameters })).toBe(false);
@@ -86,7 +139,7 @@ describe("mechanism reachability", () => {
 			expect.objectContaining({
 				mechanism: "actionFusion",
 				reason: "then_run-not-on-active-tools",
-				message: "Action Fusion is enabled but the tool the model calls does not expose then_run",
+				message: "Action Fusion is enabled but no active SoL-Pi edit/write tool exposes then_run",
 				activeTools: ["fabric_exec"],
 			}),
 		]);
@@ -104,17 +157,17 @@ describe("mechanism reachability", () => {
 		).toEqual([]);
 	});
 
-	it("reports the reducer inert when no tool is named bash", () => {
+	it("reports a missing reducer path when neither bash nor fused edit/write is available", () => {
 		expect(
 			reachabilityFindings(
 				config({ evidencePreservingReducer: true }),
-				surface([{ name: "edit", parameters: thenRunParameters }]),
+				surface([{ name: "edit", parameters: plainParameters }]),
 			),
 		).toEqual([
 			expect.objectContaining({
 				mechanism: "evidencePreservingReducer",
-				reason: "bash-tool-absent",
-				message: "Reducer is enabled but no tool in this session reports as bash",
+				reason: "reducer-path-absent",
+				message: "Reducer is enabled but no configured bash or active SoL-Pi fused edit/write path is available",
 			}),
 		]);
 	});
@@ -160,7 +213,7 @@ describe("mechanism reachability", () => {
 		]);
 		expect(pi.sessionManager.entries[0]).toMatchObject({ customType: REACHABILITY_EVENT_TYPE });
 		expect(notify).toHaveBeenCalledWith(
-			"⚡ SoL-Pi · Action Fusion is enabled but the tool the model calls does not expose then_run",
+			"⚡ SoL-Pi · Action Fusion is enabled but no active SoL-Pi edit/write tool exposes then_run",
 			"warning",
 		);
 	});
@@ -178,18 +231,20 @@ describe("mechanism reachability", () => {
 
 		expect(notify).not.toHaveBeenCalled();
 		expect(pi.sessionManager.customEntryData()).toContainEqual(
-			expect.objectContaining({ reason: "bash-tool-absent" }),
+			expect.objectContaining({ reason: "reducer-path-absent" }),
 		);
 	});
 
-	it("rechecks on the first before_agent_start after another extension replaces the surface", async () => {
+	it("checks the final surface at each provider request and deduplicates on the branch", async () => {
 		const pi = new FakePi();
 		installToolSurface(pi, [{ name: "edit", parameters: thenRunParameters }], ["edit"]);
 		const ctx = fakeContext(pi.sessionManager);
 
-		watchMechanismReachability(pi.asExtensionApi(), config({ actionFusion: true }), ctx);
+		watchMechanismReachability(pi.asExtensionApi(), config({ actionFusion: true }));
 		expect(pi.sessionManager.customEntryData()).toEqual([]);
-		expect([...pi.handlers.keys()]).toContain("before_agent_start");
+		expect([...pi.handlers.keys()]).toContain("before_provider_request");
+		await pi.emit("before_provider_request", {}, ctx);
+		expect(pi.sessionManager.customEntryData()).toEqual([]);
 
 		installToolSurface(
 			pi,
@@ -199,8 +254,8 @@ describe("mechanism reachability", () => {
 			],
 			["fabric_exec"],
 		);
-		await pi.emit("before_agent_start", { type: "before_agent_start" }, ctx);
-		await pi.emit("before_agent_start", { type: "before_agent_start" }, ctx);
+		await pi.emit("before_provider_request", { type: "before_provider_request" }, ctx);
+		await pi.emit("before_provider_request", { type: "before_provider_request" }, ctx);
 
 		expect(pi.sessionManager.customEntryData()).toEqual([
 			expect.objectContaining({ reason: "then_run-not-on-active-tools" }),
@@ -215,9 +270,11 @@ describe("mechanism reachability", () => {
 		await pi.emit("session_start", { type: "session_start" }, fakeContext(pi.sessionManager));
 
 		expect(pi.registeredTools.map((tool) => tool.name)).toEqual(["edit", "write"]);
+		expect(pi.sessionManager.customEntryData()).toEqual([]);
+		await pi.emit("before_provider_request", {}, fakeContext(pi.sessionManager));
 		expect(pi.sessionManager.customEntryData()).toContainEqual(
 			expect.objectContaining({ reason: "then_run-not-on-active-tools" }),
 		);
-		expect([...pi.handlers.keys()]).toContain("before_agent_start");
+		expect([...pi.handlers.keys()]).toContain("before_provider_request");
 	});
 });

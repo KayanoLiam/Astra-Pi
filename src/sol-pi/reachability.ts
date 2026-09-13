@@ -5,6 +5,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SolPiConfig } from "./config.ts";
+import { isActionFusionTool } from "./extensions/action-fusion/index.ts";
 
 export const REACHABILITY_EVENT_TYPE = "sol-pi-reachability-v1" as const;
 export const REACHABILITY_EVENT_SCHEMA = "sol-pi-reachability/1" as const;
@@ -21,7 +22,7 @@ export interface ToolSurfaceSnapshot {
 
 export interface ReachabilityFinding {
 	readonly mechanism: "actionFusion" | "evidencePreservingReducer";
-	readonly reason: "then_run-not-on-active-tools" | "bash-tool-absent";
+	readonly reason: "then_run-not-on-active-tools" | "reducer-path-absent";
 	readonly message: string;
 	readonly activeTools: readonly string[];
 	readonly allTools: readonly string[];
@@ -40,10 +41,7 @@ export function toolExposesThenRun(tool: ToolSurface): boolean {
 }
 
 function actionFusionReachable(surface: ToolSurfaceSnapshot): boolean {
-	if (surface.active.some(toolExposesThenRun)) return true;
-	const sawSchema = surface.active.some((tool) => isRecord(tool.parameters));
-	if (sawSchema) return false;
-	return surface.active.some((tool) => tool.name === "edit" || tool.name === "write");
+	return surface.active.some((tool) => isActionFusionTool(tool) && toolExposesThenRun(tool));
 }
 
 function callOrEmpty<T>(fn: (() => T) | undefined): T | undefined {
@@ -58,17 +56,17 @@ function callOrEmpty<T>(fn: (() => T) | undefined): T | undefined {
 /**
  * Read the tools the model can call (`getActiveTools`) and the full configured
  * set (`getAllTools`). Missing or throwing APIs are treated as "not ready"
- * rather than as an empty surface, so Pi 0.81.1 and test doubles without these
+ * rather than as an empty surface, so older Pi builds and test doubles without these
  * methods do not emit false warnings.
  */
 export function readToolSurface(pi: ExtensionAPI): ToolSurfaceSnapshot | undefined {
 	const getAllTools = callOrEmpty(pi.getAllTools?.bind(pi));
 	const getActiveTools = callOrEmpty(pi.getActiveTools?.bind(pi));
-	if (getAllTools === undefined && getActiveTools === undefined) return undefined;
+	if (!Array.isArray(getAllTools) || !Array.isArray(getActiveTools)) return undefined;
 
-	const all = Array.isArray(getAllTools) ? getAllTools : [];
+	const all = getAllTools;
 	const allByName = new Map(all.map((tool) => [tool.name, tool] as const));
-	const activeNames = Array.isArray(getActiveTools) ? getActiveTools : all.map((tool) => tool.name);
+	const activeNames = getActiveTools;
 	const active = activeNames.map((name) => allByName.get(name) ?? { name });
 	if (all.length === 0 && active.length === 0) return undefined;
 	return { active, all };
@@ -86,17 +84,20 @@ export function reachabilityFindings(
 		findings.push({
 			mechanism: "actionFusion",
 			reason: "then_run-not-on-active-tools",
-			message: "Action Fusion is enabled but the tool the model calls does not expose then_run",
+			message: "Action Fusion is enabled but no active SoL-Pi edit/write tool exposes then_run",
 			activeTools,
 			allTools,
 		});
 	}
 
-	if (config.evidencePreservingReducer && !surface.all.some((tool) => tool.name === "bash")) {
+	// The candidate contract accepts bash results and fused edit/write results.
+	// Configured bash may be invoked internally by a flat-tool harness.
+	if (config.evidencePreservingReducer && !surface.all.some((tool) => tool.name === "bash")
+		&& !actionFusionReachable(surface)) {
 		findings.push({
 			mechanism: "evidencePreservingReducer",
-			reason: "bash-tool-absent",
-			message: "Reducer is enabled but no tool in this session reports as bash",
+			reason: "reducer-path-absent",
+			message: "Reducer is enabled but no configured bash or active SoL-Pi fused edit/write path is available",
 			activeTools,
 			allTools,
 		});
@@ -127,38 +128,34 @@ export function inspectMechanismReachability(
 	pi: ExtensionAPI,
 	config: ReachabilityConfig,
 	ctx: ExtensionContext,
-	warned: Set<string> = new Set(),
 ): ReachabilityFinding[] {
 	if (!config.actionFusion && !config.evidencePreservingReducer) return [];
 	const surface = readToolSurface(pi);
 	if (!surface) return [];
 	const emitted: ReachabilityFinding[] = [];
+	const branch = ctx.sessionManager.getBranch();
 	for (const finding of reachabilityFindings(config, surface)) {
-		if (warned.has(finding.reason)) continue;
-		warned.add(finding.reason);
+		if (branch.some((entry) => entry.type === "custom"
+			&& entry.customType === REACHABILITY_EVENT_TYPE && isRecord(entry.data)
+			&& entry.data.schema === REACHABILITY_EVENT_SCHEMA
+			&& entry.data.reason === finding.reason)) continue;
 		emitFinding(pi, ctx, finding);
 		emitted.push(finding);
 	}
 	return emitted;
 }
 
-/**
- * Inspect once after SoL-Pi registers its tools, then once more on the first
- * `before_agent_start`. The second pass catches a later-loaded extension that
- * replaces the model-visible tool surface after `session_start`.
+/** Persist only at the provider boundary, after session/agent-start setup.
+ * Dedupe against the current branch, not extension-lifetime memory. Tree
+ * navigation is therefore re-evaluated on the next request without persisting
+ * a provisional surface during navigation or session initialization.
  */
 export function watchMechanismReachability(
 	pi: ExtensionAPI,
 	config: ReachabilityConfig,
-	ctx: ExtensionContext,
 ): void {
 	if (!config.actionFusion && !config.evidencePreservingReducer) return;
-	const warned = new Set<string>();
-	inspectMechanismReachability(pi, config, ctx, warned);
-	let probed = false;
-	pi.on("before_agent_start", (_event, agentCtx) => {
-		if (probed) return;
-		probed = true;
-		inspectMechanismReachability(pi, config, agentCtx, warned);
+	pi.on("before_provider_request", (_event, ctx) => {
+		inspectMechanismReachability(pi, config, ctx);
 	});
 }

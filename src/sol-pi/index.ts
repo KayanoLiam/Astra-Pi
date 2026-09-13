@@ -35,7 +35,7 @@ export function createSolPiExtension(
 			initialized = true;
 			const config = loadConfig(ctx);
 			registerConfiguredFeatures(pi, config);
-			watchMechanismReachability(pi, config, ctx);
+			watchMechanismReachability(pi, config);
 		});
 	};
 }
